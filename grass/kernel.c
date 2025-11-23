@@ -54,6 +54,16 @@ static void excp_entry(uint id) {
                sizeof(struct syscall));
         proc_set[curr_proc_idx].syscall.status = PENDING;
 
+        /* Update CPU time before process yields for system call */
+        if (proc_set[curr_proc_idx].last_schedule_time > 0) {
+            ulonglong current_time = mtime_get();
+            ulonglong runtime = current_time - proc_set[curr_proc_idx].last_schedule_time;
+            proc_set[curr_proc_idx].total_cpu_time += runtime;
+            
+            /* Update MLFQ level based on accumulated runtime */
+            mlfq_update_level(&proc_set[curr_proc_idx], runtime);
+        }
+
         proc_set_pending(curr_pid);
         proc_set[curr_proc_idx].mepc += 4;
         proc_try_syscall(&proc_set[curr_proc_idx]);
@@ -71,9 +81,18 @@ static void excp_entry(uint id) {
 static void intr_entry(uint id) {
     if (id != INTR_ID_TIMER) FATAL("excp_entry: kernel got interrupt %d", id);
     /* Student's code goes here (Preemptive Scheduler). */
-
     /* Update the process lifecycle statistics. */
-
+    if (curr_proc_idx>0 && curr_proc_idx<=MAX_NPROCESS) {
+         proc_set[curr_proc_idx].timer_interrupt_count++; // Incrementing timer interrupt count
+        /* To Calculate runtime since last schedule and update total CPU time */
+        ulonglong current_time = mtime_get();
+        if (proc_set[curr_proc_idx].last_schedule_time > 0) {
+            ulonglong runtime = current_time - proc_set[curr_proc_idx].last_schedule_time;
+            proc_set[curr_proc_idx].total_cpu_time += runtime;
+            // to update MLFQ level based on accumulated runtime 
+            mlfq_update_level(&proc_set[curr_proc_idx], runtime);
+        }
+    }
     /* Student's code ends here. */
     proc_yield();
 }
@@ -88,15 +107,23 @@ static void proc_yield() {
      * Modify the loop below to find the next process to schedule with MLFQ.
      * [System Call & Protection]
      * Do not schedule a process that should still be sleeping at this time. */
-
+    
+    // Calling mlfq_reset_level to check if we need to reset levels
+    mlfq_reset_level();
+    //Find next process using MLFQ scheduling 
     int next_idx = MAX_NPROCESS;
+    uint lowest_level = MLFQ_NLEVELS;
+    
     for (uint i = 1; i <= MAX_NPROCESS; i++) {
         struct process* p = &proc_set[(curr_proc_idx + i) % MAX_NPROCESS];
         if (p->status == PROC_PENDING_SYSCALL) proc_try_syscall(p);
 
         if (p->status == PROC_READY || p->status == PROC_RUNNABLE) {
-            next_idx = (curr_proc_idx + i) % MAX_NPROCESS;
-            break;
+            //Select process with lowest level number 
+            if (p->mlfq_level < lowest_level) {
+                lowest_level = p->mlfq_level;
+                next_idx = (curr_proc_idx + i) % MAX_NPROCESS;
+            }
         }
     }
 
@@ -105,6 +132,24 @@ static void proc_yield() {
          * Measure and record lifecycle statistics for the *next* process.
          * [System Call & Protection | Multicore & Locks]
          * Modify mstatus.MPP to enter machine or user mode after mret. */
+        
+        //Recording the time when this process is scheduled
+        ulonglong schedule_time = mtime_get();
+        proc_set[next_idx].last_schedule_time = schedule_time;
+        
+        if (proc_set[next_idx].first_schedule_time == 0) {
+            proc_set[next_idx].first_schedule_time = schedule_time;
+        }
+        static uint last_logged_level[MAX_NPROCESS + 1] = {0};
+        static int first_log[MAX_NPROCESS + 1] = {1};
+        if (proc_set[next_idx].pid > GPID_SHELL) {
+            if (first_log[next_idx] || 
+                last_logged_level[next_idx] != proc_set[next_idx].mlfq_level) {
+                //INFO("PID %d: level %d, runtime: %d ms",proc_set[next_idx].pid,proc_set[next_idx].mlfq_level,(int)(proc_set[next_idx].level_runtime / 1000));
+                last_logged_level[next_idx] = proc_set[next_idx].mlfq_level;
+                first_log[next_idx] = 0;
+            }
+        }
 
     } else {
         /* [Multicore & Locks]
